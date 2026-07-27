@@ -1,0 +1,23 @@
+# libFuzzer dictionary for GGUF.
+# These tokens get spliced into inputs so the fuzzer blows past exact-match
+# gates (like the 4-byte magic check) instead of guessing them byte-by-byte.
+
+# File magic: the ASCII bytes 'G' 'G' 'U' 'F' at offset 0.
+magic="GGUF"
+
+# High-value metadata keys — reaching these exercises deeper parsing paths
+# (string reads, array reads, type dispatch) where memory bugs tend to live.
+kv_arch="general.architecture"
+kv_name="general.name"
+kv_type="general.type"
+kv_quant_version="general.quantization_version"
+kv_file_type="general.file_type"
+kv_block_count="block_count"
+kv_context_length="context_length"
+kv_embedding_length="embedding_length"
+
+# Tokenizer keys often hold big arrays of strings — a classic bug magnet.
+tok_model="tokenizer.ggml.model"
+tok_tokens="tokenizer.ggml.tokens"
+tok_scores="tokenizer.ggml.scores"
+tok_merges="tokenizer.ggml.merges"

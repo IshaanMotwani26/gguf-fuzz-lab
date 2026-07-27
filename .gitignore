@@ -1,0 +1,30 @@
+# Docker / Build artifacts & binaries
+fuzz_gguf
+*.o
+*.so
+*.a
+*.exe
+
+# Heavy cloned repos / dependencies
+llama.cpp/
+
+# Fuzzer output folders and crash reports
+crashes/
+crashes_py/
+minimized-from-*
+
+# Python temporary files
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Exclude corpus outputs
+corpus/
+
+# Exclude compiled binaries in day1
+day1/fuzz_vuln
+day1/vuln_fixed
