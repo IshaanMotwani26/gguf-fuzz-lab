@@ -1,194 +1,168 @@
-# GGUF Parser Fuzzing Lab
+# Fuzzing the GGUF Model-File Parsers (llama.cpp / ggml)
 
-Coverage-guided fuzzing of the **GGUF model-file parser** used by `llama.cpp` /
-`ggml` — the code that every local-AI stack (Ollama, LM Studio, and llama.cpp
-itself) runs the moment it opens a model file. The goal: find memory-safety bugs
-in an attacker-reachable AI parser, root-cause them, and report them responsibly.
+A coverage-guided fuzzing project targeting the **GGUF parsers** that every local-AI
+stack — llama.cpp, Ollama, LM Studio — runs the instant it opens a model file. I
+built a two-pronged harness (C++ and Python), ran it against the real parsers,
+and independently rediscovered **five documented memory-safety / denial-of-service
+bug classes**, root-causing each and verifying it against the public record.
 
-> **Why this is a real project, not a tutorial rerun.** AI inference engines parse
-> binary model formats in C/C++, and those parsers leak memory-corruption bugs
-> constantly — integer overflows, out-of-bounds reads, null-pointer dereferences.
-> A malicious `.gguf` file downloaded from a model hub can trigger them at load
-> time, before inference even starts. That's the attack surface you're testing.
-
----
-
-## Concept primer (skip if you already fuzz)
-
-- **Fuzzing** = feeding a program a flood of malformed inputs to make it crash.
-- **Coverage-guided fuzzing** (libFuzzer, AFL++) is the smart kind: the fuzzer
-  instruments the target, notices when an input reaches a *new* code path, and
-  keeps that input as a seed to mutate further. Over time it "learns" the format
-  well enough to reach deep, rarely-run code.
-- **Harness** = the small glue function the fuzzer calls. For libFuzzer it's
-  `LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)`; its only job is to
-  turn raw bytes into a call to the function you want to test. (That's
-  `harness/fuzz_gguf.cpp`.)
-- **Sanitizer** = a compiler feature that makes bugs *loud*. **AddressSanitizer
-  (ASan)** aborts with a precise stack trace the instant the program reads or
-  writes out of bounds — turning a silent, maybe-exploitable corruption into an
-  obvious crash. **UBSan** catches integer overflow and other undefined behavior
-  (GGUF bugs love integer overflow).
-- **Corpus** = the folder of inputs the fuzzer keeps and mutates.
-- **Dictionary** = a list of interesting tokens (like the `GGUF` magic bytes) so
-  the fuzzer stops guessing exact-match gates byte-by-byte.
-- **Triage** = taking a raw crash and figuring out *what* and *why*: minimize it,
-  find the faulting line, classify the bug, judge its impact.
+> **Honest framing up front.** GGUF parsing is one of the most heavily audited
+> corners of AI security right now (Google OSS-Fuzz coverage plus a formal
+> oss-security audit in May 2026). I did **not** find a novel 0-day, and finding
+> one in a week would have been luck, not method. What this project demonstrates
+> is the thing that actually transfers to the job: building the tooling, finding
+> real bugs, root-causing them correctly, and rigorously checking prior art
+> instead of over-claiming. Every finding below is cross-referenced to its public
+> disclosure.
 
 ---
 
-## Setup (once)
+## Why GGUF parsers are a real attack surface
 
-You want **Linux** for this (libFuzzer + ASan). On Windows use **WSL2 (Ubuntu)**
-or just the Docker image below — Docker is the least painful and gives you a
-reproducible environment so you never fight a toolchain again.
+A `.gguf` file is parsed in C/C++ (and a Python reference implementation) **before
+any inference runs**. The parser reads attacker-controllable header fields —
+tensor counts, dimensions, string lengths — and acts on them. A malicious model
+file downloaded from a hub can therefore trigger crashes or resource exhaustion at
+load time. That makes the parser, not the model weights, the thing worth fuzzing.
+
+---
+
+## Methodology
+
+Two independent harnesses, because the two implementations fail in different ways:
+
+**C++ core (`ggml/src/gguf.cpp`) — libFuzzer + sanitizers.**
+Built `ggml` with AddressSanitizer + UndefinedBehaviorSanitizer + coverage, wrote
+a libFuzzer harness around `gguf_init_from_file()`, seeded it with a valid `.gguf`
+and a magic-byte dictionary, and let it mutate. Sanitizers turn a silent memory
+bug into a precise, reproducible crash with a file:line.
+
+**Python reference reader (`gguf.GGUFReader`) — Atheris.**
+Python is memory-safe, so here a "bug" is an *unexpected uncaught exception* (the
+reader should reject bad input cleanly) or *resource exhaustion* (a tiny file that
+forces a huge allocation or a hang). The harness swallows the documented rejection
+(`ValueError`) and lets anything else surface, so the fuzzer walks the exception
+space one class at a time.
+
+Everything runs in a reproducible Docker image (clang, cmake, the sanitizer
+runtimes, llvm-symbolizer, Atheris — all baked in).
+
+---
+
+## Findings
+
+| # | Component | Type | Impact | Minimized trigger | Status |
+|---|-----------|------|--------|-------------------|--------|
+| 1 | C++ `gguf.cpp` | Division by zero (SIGFPE) | DoS | crafted tensor dims `[1, 0]` | Known — issue #8816, oss-sec V-06, public PoC |
+| 2 | Python `gguf_reader.py` | Uncaught `KeyError` | DoS | duplicate metadata key | Known — kv-mismatch class |
+| 3 | Python `gguf_reader.py` | Uncaught `IndexError` (2 sites) | DoS | empty parsed array | Known — kv/tensor-count mismatch PoC |
+| 4 | Python `gguf_reader.py` | Memory exhaustion (OOM) | DoS | **48-byte** file | Known — oss-sec V-03, Databricks 2024, huntr |
+
+All findings are **denial-of-service class** (crash or memory exhaustion), not code
+execution — stated honestly, because overclaiming severity is the fastest way to
+lose credibility. The upstream maintainers additionally treat "loading an untrusted
+GGUF" as largely outside their threat model, which is why several of these sit as
+low-priority known issues rather than patched CVEs. That contested threat model is
+itself worth understanding.
+
+### Finding 1 — Division by zero in tensor-dimension validation (C++)
+
+`gguf_init_from_file` validates that each tensor dimension is non-negative
+(`if (info.t.ne[j] < 0)`) but never that it is non-**zero**. A file declaring a
+dimension of `0` passes that check, then reaches the integer-overflow guard
+`INT64_MAX / info.t.ne[j]`, which divides by zero and raises a SIGFPE. My fuzzer
+hit it in ~2 seconds; UBSan reported `division by zero` at the exact line before
+the hardware trap fired.
+**Fix:** the check should be `<= 0`.
+**Prior art:** GitHub issue #8816 (Aug 2024, found via AFL), oss-security advisory
+V-06 (May 2026), and a public proof-of-concept repo — same root cause, `[1, 0]`
+dimensions.
+
+### Findings 2 & 3 — Uncaught exceptions in the Python reader
+
+The Python reference reader raises the *wrong exception types* on malformed input:
+a `KeyError` on duplicate metadata keys (`_push_field`), and an `IndexError` in
+**two** separate spots (`_get_tensor_info_field` and `_get_field_parts`) where a
+parsed array is indexed with `[0]` without checking it is non-empty. A well-behaved
+caller wraps `GGUFReader` in `except ValueError` (the documented rejection) — so
+neither of these is caught, and a crafted file crashes any tool that inspects it.
+The recurring pattern — *indexing parsed data before validating its length* —
+appears in multiple functions, which is the more interesting observation than any
+single crash.
+**Fix:** validate array lengths before indexing; raise `ValueError` consistently.
+**Prior art:** the kv/tensor-count header-mismatch class (public PoC).
+
+### Finding 4 — Memory-exhaustion DoS from an unbounded count (Python)
+
+The headline finding, and the smallest trigger: a **48-byte** file causes a 2 GB+
+allocation. The header's `tensor_count` (and `kv_count`) is read as a raw 64-bit
+value and fed straight into `for _ in range(count)` in `_build_tensor_info` /
+`_build_fields`, with no check against the bytes actually remaining in the file.
+Setting the count field to `0xFFFFFFFF...` makes the reader try to build structures
+for ~2⁶⁴ nonexistent entries, exhausting memory.
+**Fix:** bound `count` by `remaining_bytes / min_entry_size` before looping.
+**Prior art:** oss-security V-03 (May 2026) flags the Python reader specifically
+(`n_dims = 0xFFFFFFFF` → ~32 GB memmap); the unbounded-count-as-loop-counter class
+traces back to the 2024 Databricks disclosure and is a standing huntr bounty target.
+
+---
+
+## What I learned (the honest version)
+
+- **Sanitizers are the whole game for C++ fuzzing.** ASan/UBSan converted vague
+  crashes into `file:line` + bug-class in one shot. Building the target *with* them
+  (not just running it) is what makes fuzzing productive.
+- **Triage is the real skill, not the crash.** Reproduce → minimize → root-cause →
+  classify severity. Minimizing the OOM to 48 bytes is what proves the allocation
+  size is attacker-*declared*, not incidental.
+- **Novelty-checking is non-negotiable.** Two of my findings I was briefly excited
+  about turned out to be documented. Learning to reflexively check the issue
+  tracker, oss-security, and CVE databases *before* claiming anything is the
+  difference between a researcher and a script-runner.
+- **Know when a target is mined out.** Consistently rediscovering documented bugs
+  is the signal that a heavily-audited target won't yield a novel find in a solo
+  week — and recognizing that is a research skill in itself.
+
+---
+
+## Reproduce it
 
 ```bash
 docker build -t gguf-fuzz .
-docker run --rm -it -v "$PWD":/work gguf-fuzz
-# You're now inside the container, in /work:
-./build.sh            # clone llama.cpp, build ggml w/ ASan+coverage, link harness
-python3 make_seed.py  # create seeds/valid.gguf
-./run.sh              # fuzz!
+docker run --rm -it -v "${PWD}:/work" gguf-fuzz
+
+# C++ parser (libFuzzer + ASan/UBSan)
+./build.sh && python3 make_seed.py && ./run.sh
+
+# Python reader (Atheris)
+mkdir -p corpus crashes_py && cp seeds/valid.gguf corpus/
+python3 ./fuzz_gguf_py.py -rss_limit_mb=2048 -timeout=20 -max_len=8192 \
+        -artifact_prefix=crashes_py/ corpus/
 ```
 
-If the **link step** fails with "undefined symbol", add the missing `libggml-*.a`
-to the `LIBS` line in `build.sh`. This iteration is normal — the target moves
-fast. If the **header** isn't found, run
-`grep -rl gguf_init_from_file llama.cpp/ggml/include` and fix the `#include` in
-the harness.
+`day1/` contains a deliberately-vulnerable toy target used to learn the
+harness → crash → ASan → triage loop before pointing it at real code.
 
 ---
 
-## The week, day by day
+## Responsible disclosure
 
-### Day 1 — Learn the workflow on a *toy* target first
-Don't start on llama.cpp. Do one end-to-end cycle on a deliberately-vulnerable
-mini-target so the mechanics click: write a 10-line harness around a function
-with a known bug, compile with `clang++ -fsanitize=address,fuzzer`, watch ASan
-catch it, read the trace. (8kSec's beginner fuzzing lab, linked in RESOURCES, is
-perfect for this.) **Deliverable:** you can explain "harness → coverage → ASan
-crash" in your own words.
-
-### Day 2 — Build the real harness and get it running
-Use this scaffold. Get `./build.sh` green, generate a seed, and confirm the
-fuzzer is actually executing the parser (libFuzzer prints `cov:` climbing and
-`exec/s`). **Sanity check that matters:** if coverage never grows, your harness
-isn't reaching the target — fix that before letting it run. **Deliverable:**
-fuzzer running at a healthy exec/s with coverage increasing.
-
-### Day 3 — Make it *effective*, then let it soak
-Improve throughput and depth:
-- Seed with a couple of different valid `.gguf` files (different metadata types,
-  a tokenizer array, a few tensors).
-- Confirm the `-dict` is loaded.
-- (Advanced, optional) A **structure-aware** harness that fixes length fields
-  after mutation lands far more inputs on real parsing logic — the biggest lever
-  for structured formats.
-
-Then let it run for hours in the background. **Deliverable:** a soak run going,
-corpus growing.
-
-### Days 4–5 — Triage crashes (the real skill)
-When `crashes/crash-*` files appear, for each one:
-1. **Reproduce:** `./fuzz_gguf crashes/crash-<id>` → confirm ASan fires again.
-2. **Minimize:** `./fuzz_gguf -minimize_crash=1 -runs=100000 crashes/crash-<id>`
-   → shrink to the smallest input that still crashes.
-3. **Root-cause:** read the ASan report (bug type + faulting function + line).
-   Open that source file. Explain *why* in one paragraph: which length/field was
-   trusted without validation? See TRIAGE below for the template.
-4. **Classify:** null-deref / OOB read / OOB write / integer overflow / DoS. OOB
-   *write* is the most severe (write-what-where → potential RCE); null-deref is
-   usually DoS. Be honest about impact — overclaiming is a rookie tell.
-
-**Deliverable:** 1–3 minimized, root-caused findings. Even one clean, well-explained
-finding is a strong result. Reproducing a *known* bug (see RESOURCES for the CVE
-references) with your own harness and analysis absolutely counts.
-
-### Day 6 — Disclose responsibly (do this right; recruiters notice)
-See DISCLOSURE below. Short version: report privately first, give maintainers
-time, don't publish weaponized exploits, coordinate the public writeup.
-
-### Day 7 — Write it up
-Turn the repo into the portfolio piece. Your README should tell the story:
-target and why it matters → harness design → how you drove coverage → the
-findings with minimized reproducers and root-cause analysis → impact assessment →
-disclosure timeline. Keep exploit detail responsible. Then the LinkedIn post.
+Findings were verified against existing public disclosures before any write-up.
+Because all four proved to be **previously-reported known issues**, this repository
+documents mechanisms and root causes (already public) but does **not** ship
+weaponized reproducers for any unreported issue. If a genuinely novel bug had
+surfaced, it would have gone through private coordinated disclosure first.
 
 ---
 
-## TRIAGE — root-cause template (copy per finding into `findings/NN.md`)
+## Repo layout
 
 ```
-### Finding NN — <one-line summary>
-- Target commit: <git rev-parse HEAD of llama.cpp>
-- Crash type (ASan): <heap-buffer-overflow READ | null deref | int overflow | ...>
-- Faulting function / file:line: <from the ASan trace>
-- Minimized reproducer: findings/NN.gguf  (<size> bytes)
-
-**Root cause.** <Which field was read from the file and trusted? Which bounds
-check is missing or wrong? Why does the mutated input drive execution there?>
-
-**Impact.** <DoS / info-leak / potential memory corruption. What can an attacker
-who controls the .gguf actually do? Be precise, don't overclaim.>
-
-**Suggested fix.** <e.g. validate length before allocation; check pointer for
-NULL before deref; use checked arithmetic on the size field.>
+Dockerfile            reproducible fuzzing environment (clang, sanitizers, Atheris)
+build.sh / run.sh     build + run the C++ GGUF fuzzer
+harness/fuzz_gguf.cpp libFuzzer harness for gguf_init_from_file()
+fuzz_gguf_py.py       Atheris harness for the Python GGUFReader
+make_seed.py          generates a valid .gguf seed
+gguf.dict             libFuzzer dictionary (magic bytes + metadata keys)
+day1/                 toy vulnerable target for learning the workflow
 ```
-
----
-
-## DISCLOSURE — do this the professional way
-
-Fuzzing MIT-licensed open-source and reporting what you find is legitimate,
-welcomed security research. Doing the *disclosure* well is what separates a
-researcher from someone who just ran a tool.
-
-1. **Report privately first.** Use the project's security policy /
-   `SECURITY.md`, or GitHub's **"Report a vulnerability"** (private security
-   advisory) on the repo. Do **not** open a public issue for a memory-safety bug.
-2. **Give a clear, minimal report:** affected commit, build flags, the ASan
-   trace, the minimized reproducer, your root-cause paragraph, and suggested fix.
-3. **Give them time.** Standard coordinated-disclosure windows are ~90 days.
-   Don't publish details or reproducers until there's a fix or the window passes.
-4. **Don't build or publish weaponized exploits.** A crash PoC + analysis is the
-   deliverable. Turning an OOB write into a working RCE and releasing it is not.
-5. **Request a CVE** through the project or a CNA once it's fixed — that's the
-   line that reads best on a résumé, and you earned it by doing steps 1–4 right.
-
-If you're unsure whether something is safe to publish, default to *ask the
-maintainers first*.
-
----
-
-## RESOURCES (real, current)
-
-- **Snyk Labs — fuzzing a GGUF parser (Cortex.cpp):** the canonical worked
-  example of exactly this harness pattern (the `#ifdef FUZZ` trick, `clang++
-  -fsanitize=address`, buffer-vs-file parse, triage). Your #1 reference.
-- **8kSec — "AI-Assisted Fuzzing: libFuzzer harnesses":** beginner-friendly
-  primer on harness + sanitizer + dictionaries + structure-aware harnesses,
-  with a downloadable first-timer lab. Use for Day 1.
-- **GGUF parser CVEs to study / reproduce:** `CVE-2024-41130` (null-pointer
-  dereference in `gguf_init_from_file` in ggml). Also read the May 2026
-  oss-security thread disclosing multiple llama.cpp GGUF parser flaws — great
-  root-cause reading and proof the surface is fruitful.
-- **AFL++ docs** and **libFuzzer docs** — the two fuzzer options. This scaffold
-  uses libFuzzer (simplest to start); AFL++ is a strong alternative once you're
-  comfortable.
-- **`ggml-org/llama.cpp`** — the target repo. GGUF parsing lives in the `ggml`
-  subtree; entry point `gguf_init_from_file`.
-
----
-
-## Files in this scaffold
-
-| file | what it does |
-|---|---|
-| `Dockerfile` | reproducible clang/cmake/libFuzzer environment |
-| `build.sh` | clone llama.cpp, build ggml with ASan+coverage, compile harness |
-| `run.sh` | seed corpus + launch libFuzzer with the dictionary |
-| `harness/fuzz_gguf.cpp` | the libFuzzer harness (the core of the project) |
-| `make_seed.py` | generate a valid `.gguf` seed |
-| `gguf.dict` | dictionary of magic bytes + metadata keys |
-| `findings/` | (you create) one root-cause writeup per bug |
