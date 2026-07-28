@@ -37,7 +37,7 @@ with atheris.instrument_imports():
 # (the reader's documented rejection). As you confirm each new finding, add its
 # type here so the fuzzer moves on to the next distinct bug instead of re-hitting
 # the same one. e.g. after logging the KeyError:  EXPECTED = (ValueError, KeyError)
-EXPECTED = (ValueError,)
+EXPECTED = (ValueError, KeyError, IndexError)
 
 def TestOneInput(data):
     if len(data) < 8:
